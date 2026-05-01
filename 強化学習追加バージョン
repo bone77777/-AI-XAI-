@@ -458,9 +458,9 @@ class XaiExplainerV2:
             direction = "リスク↑" if c > 0 else "安全↑ "
             print(f"│  {mark} {f:18}: {c:+.3f}  {direction} {bar}")
         print(f"│  {'─' * 55}")
-        print(f"│  📊 リスク確信度 : {risk_score:.1%}")
-        print(f"│  📍 業務コンテキスト: {biz_label} × {time_label}")
-        print(f"│  🎭 真の脅威強度 : {env.threat_intensity:.1%}（後から判明）")
+        print(f"│   リスク確信度 : {risk_score:.1%}")
+        print(f"│   業務コンテキスト: {biz_label} × {time_label}")
+        print(f"│   真の脅威強度 : {env.threat_intensity:.1%}（後から判明）")
         print(f"└{'─' * 60}┘")
 
         # --- STEP 2: マルチステップ対応の経過 ---
@@ -508,7 +508,7 @@ class XaiExplainerV2:
             action_labels = [env.ACTIONS[a]["label"] for a in actions_taken]
 
             print(f"│  {'─' * 55}")
-            print(f"│  📋 対応フロー: {' → '.join(action_labels)}")
+            print(f"│   対応フロー: {' → '.join(action_labels)}")
 
             # 段階的対応の評価
             had_escalation = any(
@@ -521,16 +521,16 @@ class XaiExplainerV2:
             )
 
             if had_escalation and had_deescalation:
-                print(f"│  💡 適応的対応: エスカレーションとデエスカレーションの")
+                print(f"│   適応的対応: エスカレーションとデエスカレーションの")
                 print(f"│     両方を実施し、状況に応じた柔軟な対応を行いました。")
             elif had_escalation:
-                print(f"│  💡 段階的エスカレーション: 脅威の深刻化に応じて")
+                print(f"│   段階的エスカレーション: 脅威の深刻化に応じて")
                 print(f"│     防御レベルを段階的に引き上げました。")
             elif had_deescalation:
-                print(f"│  💡 デエスカレーション: 状況改善に応じて")
+                print(f"│   デエスカレーション: 状況改善に応じて")
                 print(f"│     業務復旧を優先した対応に移行しました。")
             else:
-                print(f"│  💡 一貫した対応: 状況評価に基づき、同一レベルの")
+                print(f"│   一貫した対応: 状況評価に基づき、同一レベルの")
                 print(f"│     対応を維持しました。")
 
             print(f"└{'─' * 60}┘")
