@@ -1,0 +1,756 @@
+"""
+処方的AI × XAI ＋ 強化学習（DQN） — 完全拡張版
+=================================================
+
+拡張1: 状態空間の拡張
+  - 過去N回の対応履歴
+  - 時間帯（業務時間 / 夜間 / 休日）
+  - システム健全度
+  - エスカレーション回数
+
+拡張2: Deep Q-Network（DQN）
+  - ニューラルネットワークによるQ値近似
+  - Experience Replay
+  - Target Network（安定学習）
+
+拡張3: マルチステップ意思決定
+  - 1インシデントを最大5ステップで対応
+  - 段階的エスカレーション／デエスカレーション
+  - 観察 → 判断 → 再評価の連続ループ
+"""
+
+import numpy as np
+import random
+from collections import deque, defaultdict
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# 再現性のためのシード
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+
+# =============================================================================
+# 1. 拡張環境（Multi-Step Incident Response Environment）
+# =============================================================================
+class MultiStepIncidentEnv:
+    """
+    マルチステップ対応のインシデント環境。
+    1インシデントを最大MAX_STEPSステップで対応し、
+    各ステップでエージェントが行動を選択 → 環境が遷移する。
+    """
+
+    MAX_STEPS = 5  # 1インシデントあたりの最大ステップ数
+
+    # 行動空間（3アクション）
+    ACTIONS = {
+        0: {"name": "MONITOR",  "label": "監視のみ",  "defense": 0.1, "disruption": 0.02},
+        1: {"name": "THROTTLE", "label": "帯域制限",  "defense": 0.6, "disruption": 0.15},
+        2: {"name": "ISOLATE",  "label": "完全遮断",  "defense": 1.0, "disruption": 1.00},
+    }
+
+    # 時間帯カテゴリ
+    TIME_CATEGORIES = {
+        0: "業務時間",
+        1: "夜間",
+        2: "休日",
+    }
+
+    N_ACTIONS = 3
+    HISTORY_LEN = 3  # 過去N回の行動履歴
+
+    # 状態ベクトルの次元数:
+    #   risk_score(1) + is_closing(1) + time_category_onehot(3)
+    #   + system_health(1) + escalation_count(1) + current_step(1)
+    #   + action_history(HISTORY_LEN) + threat_intensity(1)
+    STATE_DIM = 1 + 1 + 3 + 1 + 1 + 1 + HISTORY_LEN + 1  # = 12
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self, risk_score=None, is_closing=None, time_cat=None,
+              threat_intensity=None):
+        """新しいインシデントのエピソードを開始"""
+
+        # ランダム生成 or 指定
+        self.risk_score = risk_score if risk_score is not None else random.random()
+        self.is_closing = is_closing if is_closing is not None else (random.random() < 0.3)
+        self.time_category = time_cat if time_cat is not None else random.choice([0, 1, 2])
+
+        # 脅威の真の強度（エージェントには直接見えない — risk_scoreは推定値）
+        if threat_intensity is not None:
+            self.threat_intensity = threat_intensity
+        else:
+            # risk_scoreにノイズを加えた真の脅威レベル
+            noise = np.clip(np.random.normal(0, 0.15), -0.3, 0.3)
+            self.threat_intensity = np.clip(self.risk_score + noise, 0, 1)
+
+        # 動的状態
+        self.system_health = 1.0         # システム健全度 (0~1)
+        self.escalation_count = 0        # エスカレーション回数
+        self.current_step = 0            # 現在のステップ
+        self.action_history = [-1] * self.HISTORY_LEN  # 過去の行動（-1=未実行）
+        self.done = False
+        self.cumulative_reward = 0.0
+
+        # エピソードログ
+        self.step_log = []
+
+        return self._get_state_vector()
+
+    def _get_state_vector(self) -> np.ndarray:
+        """現在の状態を連続ベクトルに変換"""
+        vec = []
+
+        # (1) リスクスコア
+        vec.append(self.risk_score)
+
+        # (2) 決算期フラグ
+        vec.append(1.0 if self.is_closing else 0.0)
+
+        # (3) 時間帯（one-hot）
+        time_onehot = [0.0, 0.0, 0.0]
+        time_onehot[self.time_category] = 1.0
+        vec.extend(time_onehot)
+
+        # (4) システム健全度
+        vec.append(self.system_health)
+
+        # (5) エスカレーション回数（正規化）
+        vec.append(self.escalation_count / self.MAX_STEPS)
+
+        # (6) 現在のステップ（正規化）
+        vec.append(self.current_step / self.MAX_STEPS)
+
+        # (7) 過去の行動履歴（-1を0に、0/1/2を正規化）
+        for a in self.action_history:
+            vec.append((a + 1) / 3.0)  # -1→0, 0→0.33, 1→0.67, 2→1.0
+
+        # (8) 脅威の推定強度（観測可能なリスク指標）
+        # 実際のシステムではIDS/IPSの出力に相当
+        observable_threat = np.clip(
+            self.threat_intensity + np.random.normal(0, 0.05), 0, 1
+        )
+        vec.append(observable_threat)
+
+        return np.array(vec, dtype=np.float32)
+
+    def step(self, action: int):
+        """
+        1ステップ実行。
+        Returns: (next_state, reward, done, info)
+        """
+        if self.done:
+            raise RuntimeError("Episode already done. Call reset().")
+
+        act = self.ACTIONS[action]
+        prev_action = self.action_history[-1] if self.action_history[-1] != -1 else None
+
+        # --- エスカレーション検出 ---
+        if prev_action is not None and action > prev_action:
+            self.escalation_count += 1
+
+        # --- 行動履歴の更新 ---
+        self.action_history.pop(0)
+        self.action_history.append(action)
+
+        # --- ビジネス影響の重み ---
+        biz_weight = 1.0
+        if self.is_closing:
+            biz_weight *= 2.0
+        if self.time_category == 0:  # 業務時間中
+            biz_weight *= 1.5
+        elif self.time_category == 2:  # 休日
+            biz_weight *= 0.5
+
+        # --- 脅威によるダメージ計算 ---
+        # 防御力が足りないと、脅威がシステムにダメージを与える
+        unmitigated = max(0, self.threat_intensity - act["defense"])
+        damage = unmitigated * 0.25  # 1ステップあたりの最大ダメージ
+        self.system_health = max(0, self.system_health - damage)
+
+        # --- 報酬計算 ---
+        reward = self._compute_reward(action, act, damage, biz_weight)
+        self.cumulative_reward += reward
+
+        # --- ステップログ ---
+        self.step_log.append({
+            "step": self.current_step,
+            "action": act["label"],
+            "action_idx": action,
+            "defense": act["defense"],
+            "damage": damage,
+            "health": self.system_health,
+            "reward": reward,
+            "cumulative_reward": self.cumulative_reward,
+        })
+
+        # --- 終了判定 ---
+        self.current_step += 1
+        if self.current_step >= self.MAX_STEPS:
+            self.done = True
+        if self.system_health <= 0:
+            self.done = True  # システムダウン
+
+        # 脅威が完全に無力化された場合
+        if self.threat_intensity < 0.1 and act["defense"] >= 0.5:
+            self.done = True
+
+        next_state = self._get_state_vector()
+
+        info = {
+            "health": self.system_health,
+            "threat_intensity": self.threat_intensity,
+            "escalation_count": self.escalation_count,
+            "step": self.current_step,
+        }
+
+        return next_state, reward, self.done, info
+
+    def _compute_reward(self, action, act, damage, biz_weight):
+        """
+        =====================================================
+        報酬関数（拡張版）
+        =====================================================
+
+        R = R_defense + R_health + R_disruption + R_escalation
+
+        R_defense   : 脅威を防いだ報酬 / 見逃しペナルティ
+        R_health    : システム健全度の維持報酬
+        R_disruption: 業務中断ペナルティ（業務時間×決算期で増幅）
+        R_escalation: 段階的対応のボーナス / 過剰反応ペナルティ
+        """
+
+        reward = 0.0
+
+        # --- R_defense: 防御成果 ---
+        if self.threat_intensity >= 0.5:
+            # 高脅威時: 防御力に応じた報酬
+            if act["defense"] >= 0.6:
+                reward += 8.0 * act["defense"]
+            else:
+                # 見逃しペナルティ（脅威が高いほど大きい）
+                reward -= 15.0 * self.threat_intensity
+        else:
+            # 低脅威時: 静観が正解
+            if act["defense"] <= 0.3:
+                reward += 3.0  # 適切な静観
+            else:
+                reward -= 3.0 * act["disruption"] * biz_weight  # 過剰対応
+
+        # --- R_health: システム健全度 ---
+        if damage > 0:
+            reward -= damage * 20.0  # ダメージは常に悪い
+        if self.system_health > 0.8:
+            reward += 1.0  # 健全度維持ボーナス
+
+        # --- R_disruption: 業務中断コスト ---
+        disruption_cost = act["disruption"] * 5.0 * biz_weight
+        reward -= disruption_cost
+
+        # --- R_escalation: 段階的対応 ---
+        prev = self.action_history[-2] if len(self.action_history) >= 2 and self.action_history[-2] != -1 else None
+        if prev is not None:
+            if action > prev and self.threat_intensity >= 0.5:
+                # 脅威が高い状況でのエスカレーション → ボーナス
+                reward += 3.0
+            elif action > prev and self.threat_intensity < 0.3:
+                # 低脅威でのエスカレーション → ペナルティ
+                reward -= 4.0 * biz_weight
+            elif action < prev and self.threat_intensity < 0.3:
+                # 脅威低下時のデエスカレーション → ボーナス
+                reward += 2.0
+
+        # --- 終局ボーナス/ペナルティ ---
+        if self.system_health <= 0:
+            reward -= 50.0  # システムダウンは致命的
+        elif self.done and self.system_health > 0.7:
+            reward += 10.0  # 健全な状態でインシデント解決
+
+        return reward
+
+
+# =============================================================================
+# 2. DQN（Deep Q-Network）
+# =============================================================================
+
+class ReplayBuffer:
+    """Experience Replay バッファ"""
+    def __init__(self, capacity=50000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (
+            np.array(states),
+            np.array(actions),
+            np.array(rewards, dtype=np.float32),
+            np.array(next_states),
+            np.array(dones, dtype=np.float32),
+        )
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class QNetwork(nn.Module):
+    """Q値を近似するニューラルネットワーク"""
+    def __init__(self, state_dim, n_actions, hidden_dims=[128, 128, 64]):
+        super().__init__()
+        layers = []
+        prev_dim = state_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev_dim, h))
+            layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm(h))
+            prev_dim = h
+        layers.append(nn.Linear(prev_dim, n_actions))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class DQNAgent:
+    """
+    DQNエージェント。
+    - Experience Replay で学習の安定化
+    - Target Network で過大評価の抑制
+    - ε-greedy で探索と活用のバランス
+    """
+
+    def __init__(self, state_dim, n_actions, lr=1e-3, gamma=0.99,
+                 epsilon=1.0, epsilon_decay=0.9995, epsilon_min=0.05,
+                 batch_size=64, target_update_freq=100,
+                 buffer_capacity=50000):
+        self.state_dim = state_dim
+        self.n_actions = n_actions
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        self.batch_size = batch_size
+        self.target_update_freq = target_update_freq
+
+        # ネットワーク
+        self.device = torch.device("cpu")
+        self.q_net = QNetwork(state_dim, n_actions).to(self.device)
+        self.target_net = QNetwork(state_dim, n_actions).to(self.device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        self.loss_fn = nn.SmoothL1Loss()  # Huber Loss
+
+        # Experience Replay
+        self.buffer = ReplayBuffer(buffer_capacity)
+
+        # 学習カウンタ
+        self.train_steps = 0
+        self.losses = []
+
+    def choose_action(self, state: np.ndarray, training=True) -> int:
+        if training and random.random() < self.epsilon:
+            return random.randint(0, self.n_actions - 1)
+        with torch.no_grad():
+            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            q_vals = self.q_net(state_t)
+            return int(q_vals.argmax(dim=1).item())
+
+    def store_transition(self, state, action, reward, next_state, done):
+        self.buffer.push(state, action, reward, next_state, done)
+
+    def train_step(self):
+        """1回の学習ステップ"""
+        if len(self.buffer) < self.batch_size:
+            return None
+
+        states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
+
+        states_t = torch.FloatTensor(states).to(self.device)
+        actions_t = torch.LongTensor(actions).to(self.device)
+        rewards_t = torch.FloatTensor(rewards).to(self.device)
+        next_states_t = torch.FloatTensor(next_states).to(self.device)
+        dones_t = torch.FloatTensor(dones).to(self.device)
+
+        # 現在のQ値
+        current_q = self.q_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+
+        # ターゲットQ値（Target Networkで計算）
+        with torch.no_grad():
+            next_q = self.target_net(next_states_t).max(dim=1)[0]
+            target_q = rewards_t + self.gamma * next_q * (1 - dones_t)
+
+        loss = self.loss_fn(current_q, target_q)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
+        self.optimizer.step()
+
+        self.train_steps += 1
+        self.losses.append(loss.item())
+
+        # Target Networkの更新
+        if self.train_steps % self.target_update_freq == 0:
+            self.target_net.load_state_dict(self.q_net.state_dict())
+
+        return loss.item()
+
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def get_q_values(self, state: np.ndarray) -> np.ndarray:
+        """特定の状態のQ値を取得"""
+        with torch.no_grad():
+            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            return self.q_net(state_t).squeeze(0).numpy()
+
+
+# =============================================================================
+# 3. XAI説明モジュール（マルチステップ対応版）
+# =============================================================================
+class XaiExplainerV2:
+    """マルチステップ対応のXAI説明エンジン"""
+
+    def __init__(self):
+        self.feature_weights = {
+            "traffic_volume":  0.7,
+            "ti_reputation":   0.4,
+            "valid_signature": -0.8,
+            "internal_process":-0.5,
+        }
+
+    def compute_risk(self, logs: dict) -> tuple:
+        contributions = {}
+        risk_score = 0.0
+        for feature, weight in self.feature_weights.items():
+            value = logs.get(feature, 0)
+            contribution = value * weight
+            contributions[feature] = contribution
+            risk_score += contribution
+        risk_score = max(0.0, min(1.0, risk_score))
+        return risk_score, contributions
+
+    def explain_episode(self, env: MultiStepIncidentEnv, logs: dict,
+                        contributions: dict, q_values_per_step: list):
+        """マルチステップエピソード全体の説明レポート"""
+        risk_score = env.risk_score
+        time_label = env.TIME_CATEGORIES[env.time_category]
+        biz_label = "決算期" if env.is_closing else "通常期"
+
+        print("=" * 70)
+        print("  XAI × 処方的AI × DQN強化学習 — マルチステップ統合レポート")
+        print("=" * 70)
+
+        # --- STEP 1: XAI 判定根拠 ---
+        print("\n┌─ [PHASE 1] XAI：初期リスク判定根拠 ──────────────────────┐")
+        for f, c in contributions.items():
+            mark = "🚨" if c > 0 else "✅"
+            bar = "█" * int(abs(c) * 20)
+            direction = "リスク↑" if c > 0 else "安全↑ "
+            print(f"│  {mark} {f:18}: {c:+.3f}  {direction} {bar}")
+        print(f"│  {'─' * 55}")
+        print(f"│  📊 リスク確信度 : {risk_score:.1%}")
+        print(f"│  📍 業務コンテキスト: {biz_label} × {time_label}")
+        print(f"│  🎭 真の脅威強度 : {env.threat_intensity:.1%}（後から判明）")
+        print(f"└{'─' * 60}┘")
+
+        # --- STEP 2: マルチステップ対応の経過 ---
+        print(f"\n┌─ [PHASE 2] マルチステップ対応経過 ──────────────────────┐")
+        print(f"│  Step │ アクション │ 防御力 │ 被ダメージ │ 健全度 │  報酬  │ 累積報酬 │")
+        print(f"│  ─────┼──────────┼────────┼──────────┼────────┼────────┼─────────│")
+
+        for log in env.step_log:
+            esc_mark = ""
+            if log["step"] > 0:
+                prev = env.step_log[log["step"] - 1]["action_idx"]
+                curr = log["action_idx"]
+                if curr > prev:
+                    esc_mark = " ⬆"
+                elif curr < prev:
+                    esc_mark = " ⬇"
+
+            print(f"│  {log['step']:4d}  │ {log['action']:8}{esc_mark:3}│ "
+                  f"{log['defense']:5.0%}  │ {log['damage']:9.3f} │ "
+                  f"{log['health']:5.1%}  │ {log['reward']:+6.1f} │ "
+                  f"{log['cumulative_reward']:+7.1f}  │")
+
+        final_health = env.system_health
+        health_icon = "🟢" if final_health > 0.7 else "🟡" if final_health > 0.3 else "🔴"
+        print(f"│  {'─' * 55}")
+        print(f"│  {health_icon} 最終健全度: {final_health:.1%}  "
+              f"│  エスカレーション: {env.escalation_count}回  "
+              f"│  総報酬: {env.cumulative_reward:+.1f}")
+        print(f"└{'─' * 60}┘")
+
+        # --- STEP 3: DQNのQ値推移 ---
+        if q_values_per_step:
+            print(f"\n┌─ [PHASE 3] DQN：各ステップのQ値推移 ──────────────────┐")
+            action_names = ["MONITOR", "THROTTLE", "ISOLATE"]
+            for i, (q_vals, chosen) in enumerate(q_values_per_step):
+                chosen_name = action_names[chosen]
+                q_str = "  ".join(
+                    f"{name}:{q:+6.1f}{'◀' if name == chosen_name else ' '}"
+                    for name, q in zip(action_names, q_vals)
+                )
+                print(f"│  Step{i}: {q_str}")
+
+            # 行動変遷の解説
+            actions_taken = [s[1] for s in q_values_per_step]
+            action_labels = [env.ACTIONS[a]["label"] for a in actions_taken]
+
+            print(f"│  {'─' * 55}")
+            print(f"│  📋 対応フロー: {' → '.join(action_labels)}")
+
+            # 段階的対応の評価
+            had_escalation = any(
+                actions_taken[i] > actions_taken[i-1]
+                for i in range(1, len(actions_taken))
+            )
+            had_deescalation = any(
+                actions_taken[i] < actions_taken[i-1]
+                for i in range(1, len(actions_taken))
+            )
+
+            if had_escalation and had_deescalation:
+                print(f"│  💡 適応的対応: エスカレーションとデエスカレーションの")
+                print(f"│     両方を実施し、状況に応じた柔軟な対応を行いました。")
+            elif had_escalation:
+                print(f"│  💡 段階的エスカレーション: 脅威の深刻化に応じて")
+                print(f"│     防御レベルを段階的に引き上げました。")
+            elif had_deescalation:
+                print(f"│  💡 デエスカレーション: 状況改善に応じて")
+                print(f"│     業務復旧を優先した対応に移行しました。")
+            else:
+                print(f"│  💡 一貫した対応: 状況評価に基づき、同一レベルの")
+                print(f"│     対応を維持しました。")
+
+            print(f"└{'─' * 60}┘")
+
+
+# =============================================================================
+# 4. 統合システム
+# =============================================================================
+class PrescriptiveAI_DQN:
+    """処方的AI × XAI × DQN強化学習 の統合システム（完全拡張版）"""
+
+    def __init__(self):
+        self.env = MultiStepIncidentEnv()
+        self.agent = DQNAgent(
+            state_dim=self.env.STATE_DIM,
+            n_actions=self.env.N_ACTIONS,
+            lr=5e-4,
+            gamma=0.95,
+            epsilon=1.0,
+            epsilon_decay=0.9997,
+            epsilon_min=0.05,
+            batch_size=64,
+            target_update_freq=200,
+        )
+        self.explainer = XaiExplainerV2()
+
+        # 学習メトリクス
+        self.episode_rewards_log = []
+
+    def train(self, n_episodes=8000, verbose=True):
+        """DQNトレーニング（マルチステップエピソード）"""
+        if verbose:
+            print("=" * 70)
+            print("  DQN強化学習トレーニング開始")
+            print(f"  エピソード数: {n_episodes} | 状態次元: {self.env.STATE_DIM}")
+            print(f"  最大ステップ/ep: {self.env.MAX_STEPS} | バッチサイズ: {self.agent.batch_size}")
+            print("=" * 70)
+
+        reward_window = deque(maxlen=500)
+
+        for ep in range(n_episodes):
+            state = self.env.reset()
+            episode_reward = 0.0
+
+            while not self.env.done:
+                action = self.agent.choose_action(state, training=True)
+                next_state, reward, done, info = self.env.step(action)
+
+                self.agent.store_transition(state, action, reward, next_state, done)
+                loss = self.agent.train_step()
+
+                state = next_state
+                episode_reward += reward
+
+            self.agent.decay_epsilon()
+            self.episode_rewards_log.append(episode_reward)
+            reward_window.append(episode_reward)
+
+            if verbose and (ep + 1) % 1000 == 0:
+                avg_r = np.mean(reward_window)
+                avg_loss = np.mean(self.agent.losses[-500:]) if self.agent.losses else 0
+                print(f"  Episode {ep+1:5d} | "
+                      f"平均報酬: {avg_r:+7.2f} | "
+                      f"損失: {avg_loss:.4f} | "
+                      f"ε: {self.agent.epsilon:.4f}")
+
+        if verbose:
+            print(f"\n  ✅ トレーニング完了！")
+            print(f"     総学習ステップ: {self.agent.train_steps}")
+            print(f"     最終ε: {self.agent.epsilon:.4f}")
+            print(f"     最終平均報酬(500ep): {np.mean(list(reward_window)):+.2f}")
+            self._print_policy_analysis()
+
+    def _print_policy_analysis(self):
+        """学習済み方策の分析"""
+        print(f"\n┌─ 学習済み方策の分析 ──────────────────────────────────┐")
+
+        scenarios = [
+            ("LOW×通常期×業務時間",    0.15, False, 0),
+            ("LOW×決算期×業務時間",    0.15, True,  0),
+            ("MEDIUM×通常期×業務時間", 0.45, False, 0),
+            ("MEDIUM×決算期×業務時間", 0.45, True,  0),
+            ("HIGH×通常期×業務時間",   0.75, False, 0),
+            ("HIGH×決算期×業務時間",   0.75, True,  0),
+            ("HIGH×通常期×夜間",       0.75, False, 1),
+            ("HIGH×決算期×休日",       0.75, True,  2),
+            ("CRITICAL×通常期×業務時間", 0.95, False, 0),
+            ("CRITICAL×決算期×業務時間", 0.95, True,  0),
+        ]
+
+        print(f"│  {'シナリオ':30} │ {'MONITOR':>8} {'THROTTLE':>9} {'ISOLATE':>8} │ {'初手':>8} │")
+        print(f"│  {'─'*30}─┼{'─'*28}─┼{'─'*9}─│")
+
+        for label, risk, closing, time_cat in scenarios:
+            state = self.env.reset(
+                risk_score=risk, is_closing=closing, time_cat=time_cat,
+                threat_intensity=risk  # 分析用に真値=推定値
+            )
+            q_vals = self.agent.get_q_values(state)
+            best_action = self.env.ACTIONS[int(np.argmax(q_vals))]["label"]
+            print(f"│  {label:30} │ {q_vals[0]:+8.1f} {q_vals[1]:+9.1f} {q_vals[2]:+8.1f} │ {best_action:>8} │")
+
+        print(f"└{'─' * 70}┘")
+
+    def predict(self, logs: dict, business_context: dict, time_category: int = 0):
+        """
+        推論フェーズ: マルチステップ対応の実行とXAI説明
+        """
+        # XAIでリスク算出
+        risk_score, contributions = self.explainer.compute_risk(logs)
+
+        is_closing = business_context.get("is_closing_period", False)
+
+        # エピソードの開始
+        state = self.env.reset(
+            risk_score=risk_score,
+            is_closing=is_closing,
+            time_cat=time_category,
+        )
+
+        # マルチステップ実行
+        q_values_per_step = []
+
+        while not self.env.done:
+            q_vals = self.agent.get_q_values(state)
+            action = self.agent.choose_action(state, training=False)
+            q_values_per_step.append((q_vals.tolist(), action))
+
+            next_state, reward, done, info = self.env.step(action)
+            state = next_state
+
+        # XAI統合レポート
+        self.explainer.explain_episode(self.env, logs, contributions, q_values_per_step)
+
+        return {
+            "risk_score": risk_score,
+            "contributions": contributions,
+            "final_health": self.env.system_health,
+            "total_reward": self.env.cumulative_reward,
+            "steps": len(self.env.step_log),
+            "step_log": self.env.step_log,
+        }
+
+
+# =============================================================================
+# 5. 実行
+# =============================================================================
+if __name__ == "__main__":
+
+    system = PrescriptiveAI_DQN()
+    system.train(n_episodes=8000)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # シナリオ1: 元のテストケース（決算期・業務時間・中リスク）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("\n\n" + "🔷" * 35)
+    print("  シナリオ1：経理部の決算期 × 業務時間 × 中程度リスク通信")
+    print("🔷" * 35)
+
+    result1 = system.predict(
+        logs={
+            "traffic_volume": 1.0,
+            "ti_reputation": 0.5,
+            "valid_signature": 1.0,
+            "internal_process": 1.0,
+        },
+        business_context={"is_closing_period": True},
+        time_category=0,  # 業務時間
+    )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # シナリオ2: 通常期・夜間・高リスク（署名なし・外部プロセス）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("\n\n" + "🔶" * 35)
+    print("  シナリオ2：通常期 × 夜間 × 高リスク（署名なし・外部プロセス）")
+    print("🔶" * 35)
+
+    result2 = system.predict(
+        logs={
+            "traffic_volume": 1.0,
+            "ti_reputation": 0.9,
+            "valid_signature": 0.0,
+            "internal_process": 0.0,
+        },
+        business_context={"is_closing_period": False},
+        time_category=1,  # 夜間
+    )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # シナリオ3: 決算期 × 業務時間 × 高リスク（最難関ジレンマ）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("\n\n" + "🔴" * 35)
+    print("  シナリオ3：決算期 × 業務時間 × 高リスク（可用性 vs 安全性の最難関ジレンマ）")
+    print("🔴" * 35)
+
+    result3 = system.predict(
+        logs={
+            "traffic_volume": 1.0,
+            "ti_reputation": 0.8,
+            "valid_signature": 0.0,
+            "internal_process": 0.0,
+        },
+        business_context={"is_closing_period": True},
+        time_category=0,  # 業務時間
+    )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # シナリオ4（新規）: 休日 × 低リスク（過剰対応を避けるべき場面）
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print("\n\n" + "🟢" * 35)
+    print("  シナリオ4：通常期 × 休日 × 低リスク（過剰対応テスト）")
+    print("🟢" * 35)
+
+    result4 = system.predict(
+        logs={
+            "traffic_volume": 0.3,
+            "ti_reputation": 0.1,
+            "valid_signature": 1.0,
+            "internal_process": 1.0,
+        },
+        business_context={"is_closing_period": False},
+        time_category=2,  # 休日
+    )
